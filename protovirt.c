@@ -24,50 +24,95 @@
 
 // guest vm stack size
 #define GUEST_STACK_SIZE 				64
+
+#define PERF_EMULATE_PTWRITE_8_BITS \
+                "1: shl %rax\n"     \
+                "   jc 1f\n"        \
+                "1: shl %rax\n"     \
+                "   jc 1f\n"        \
+                "1: shl %rax\n"     \
+                "   jc 1f\n"        \
+                "1: shl %rax\n"     \
+                "   jc 1f\n"        \
+                "1: shl %rax\n"     \
+                "   jc 1f\n"        \
+                "1: shl %rax\n"     \
+                "   jc 1f\n"        \
+                "1: shl %rax\n"     \
+                "   jc 1f\n"        \
+                "1: shl %rax\n"     \
+                "   jc 1f\n"
+
+#define PERF_EMULATE_PTWRITE_UD2        ".byte 0x0f, 0x0b\n"
+#define PERF_EMULATE_PTWRITE_MAGIC        PERF_EMULATE_PTWRITE_UD2 ".ascii \"perf,ptwrite  \"\n"
+void perf_emulate_ptwrite(uint64_t x __attribute__ ((__unused__)))
+{
+         /* Assumes SysV ABI : x passed in rdi */
+        __asm__ volatile (
+                "jmp 1f\n"
+                PERF_EMULATE_PTWRITE_MAGIC
+                "1: mov %rdi, %rax\n"
+                PERF_EMULATE_PTWRITE_8_BITS
+                PERF_EMULATE_PTWRITE_8_BITS
+                PERF_EMULATE_PTWRITE_8_BITS
+                PERF_EMULATE_PTWRITE_8_BITS
+                PERF_EMULATE_PTWRITE_8_BITS
+                PERF_EMULATE_PTWRITE_8_BITS
+                PERF_EMULATE_PTWRITE_8_BITS
+                PERF_EMULATE_PTWRITE_8_BITS
+                "1: nop\n"
+        );
+}
+
 // code that will be run by guest
 static void guest_code(void)
 {
-    asm volatile("cpuid");
+	int i = 0;
 
+	while (i < 10) {
+		perf_emulate_ptwrite(0xdeadbeef);
+		++i;
+	}
+	if (irqs_disabled()) {
+		asm volatile ("vmcall");
+	} else {
+		asm volatile ("cpuid");
+	}
 }
 
 // CH 23.6, Vol 3
 // Checking the support of VMX
 bool vmxSupport(void)
 {
-
-    int getVmxSupport, vmxBit;
-    __asm__("mov $1, %rax");
-    __asm__("cpuid");
-    __asm__("mov %%ecx , %0\n\t":"=r" (getVmxSupport));
-    vmxBit = (getVmxSupport >> 5) & 1;
-    if (vmxBit == 1){
-        return true;
-    }
-    else {
-        return false;
-    }
-    return false;
-
+	int getVmxSupport, vmxBit;
+	__asm__("mov $1, %rax");
+	__asm__("cpuid");
+	__asm__("mov %%ecx , %0\n\t":"=r" (getVmxSupport));
+	vmxBit = (getVmxSupport >> 5) & 1;
+	if (vmxBit == 1){
+		return true;
+	} else {
+		return false;
+	}
+	return false;
 }
-
 
 // CH 23.7, Vol 3
 // Enter in VMX mode
 bool getVmxOperation(void) {
-    //unsigned long cr0;
+	//unsigned long cr0;
 	unsigned long cr4;
 	unsigned long cr0;
-    uint64_t feature_control;
+	uint64_t feature_control;
 	uint64_t required;
 	long int vmxon_phy_region = 0;
 	u32 low1 = 0;
-    // setting CR4.VMXE[bit 13] = 1
-    __asm__ __volatile__("mov %%cr4, %0" : "=r"(cr4) : : "memory");
-    cr4 |= X86_CR4_VMXE;
-    __asm__ __volatile__("mov %0, %%cr4" : : "r"(cr4) : "memory");
+	// setting CR4.VMXE[bit 13] = 1
+	__asm__ __volatile__("mov %%cr4, %0" : "=r"(cr4) : : "memory");
+	cr4 |= X86_CR4_VMXE;
+	__asm__ __volatile__("mov %0, %%cr4" : : "r"(cr4) : "memory");
 
-    /*
+	/*
 	 * Configure IA32_FEATURE_CONTROL MSR to allow VMXON:
 	 *  Bit 0: Lock bit. If clear, VMXON causes a #GP.
 	 *  Bit 2: Enables VMXON outside of SMX operation. If clear, VMXON
@@ -98,17 +143,16 @@ bool getVmxOperation(void) {
 
 	// allocating 4kib((4096 bytes) of memory for vmxon region
 	vmxonRegion = kzalloc(MYPAGE_SIZE,GFP_KERNEL);
-   	if(vmxonRegion==NULL){
+	if(vmxonRegion==NULL){
 		printk(KERN_INFO "Error allocating vmxon region\n");
-      	return false;
-   	}
+		return false;
+	}
 	vmxon_phy_region = __pa(vmxonRegion);
 	*(uint32_t *)vmxonRegion = vmcs_revision_id();
 	if (_vmxon(vmxon_phy_region))
 		return false;
 	return true;
 }
-
 
 // CH 24.2, Vol 3
 // allocating VMCS region
@@ -155,7 +199,10 @@ bool initVmcsControlField(void) {
 	uint32_t procbased_control_final = (procbased_control0 & procbased_control1);
 	uint32_t procbased_secondary_control_final = (procbased_secondary_control0 & procbased_secondary_control1);
 	uint32_t vm_exit_control_final = (vm_exit_control0 & vm_exit_control1);
-	uint32_t vm_entry_control_final = (vm_entry_control0 & vm_entry_control1);
+	uint32_t vm_entry_control_final = (vm_entry_control0 & vm_entry_control1)
+					  | (VM_ENTRY_LOAD_IA32_RTIT_CTL)
+					  | (VM_ENTRY_IA32E_MODE) /* guest should be 64 bit */
+					  ;
 
 	/* CH 24.7.1, Vol 3
 	// for supporting 64 bit host
@@ -172,6 +219,32 @@ bool initVmcsControlField(void) {
 	//uint32_t procbased_secondary_control_final = procbased_secondary_control_final | unrestricted_guest | enabling_ept;
 	*/
 
+	uint64_t guest_ia32_rtit_ctrl_msr_val = TRACE_EN
+						// | CR3_FILTER
+						| TO_PA | BRANCH_EN
+						| CTL_OS | CTL_USER;
+	uint64_t host_ia32_rtit_ctrl_msr_val = TO_PA | CTL_OS | CTL_USER;
+	int pt_buffer_order = 7;
+	topa = (uint64_t*)__get_free_pages(GFP_KERNEL | __GFP_ZERO, pt_buffer_order);
+
+	guest[0].index = MSR_IA32_RTIT_CTL;
+	guest[0].reserved = 0;
+	guest[0].value = 0xdeadbeef;
+	host[0].index = MSR_IA32_RTIT_CTL;
+	host[0].reserved = 0;
+	host[0].value = host_ia32_rtit_ctrl_msr_val;
+	// vmwrite(VM_ENTRY_MSR_LOAD_COUNT, 1);
+	// vmwrite(VM_ENTRY_MSR_LOAD_ADDR, __pa(guest));
+	vmwrite(VM_EXIT_MSR_LOAD_COUNT, 1);
+	vmwrite(VM_EXIT_MSR_LOAD_ADDR, __pa(host));
+	vmwrite(VM_EXIT_MSR_STORE_COUNT, 1);
+	vmwrite(VM_EXIT_MSR_STORE_ADDR, __pa(guest));
+
+	wrmsrl(MSR_IA32_RTIT_CR3_MATCH, get_cr3()); // tell intel pt to only trace current cr3
+	wrmsrl(MSR_IA32_RTIT_OUTPUT_BASE, __pa(topa));
+	wrmsrl(MSR_IA32_RTIT_OUTPUT_MASK_PTRS, ((1ull << (PAGE_SHIFT + pt_buffer_order)) - 1));
+	vmwrite(GUEST_IA32_RTIT_CTL, guest_ia32_rtit_ctrl_msr_val);
+
 	// writing the value to control field
 	vmwrite(PIN_BASED_VM_EXEC_CONTROLS, pinbased_control_final);
 	vmwrite(PROC_BASED_VM_EXEC_CONTROLS, procbased_control_final);
@@ -186,8 +259,6 @@ bool initVmcsControlField(void) {
 
 	vmwrite(VM_EXIT_CONTROLS, __rdmsr1(MSR_IA32_VMX_EXIT_CTLS) |
 		VM_EXIT_HOST_ADDR_SPACE_SIZE);
-	vmwrite(VM_ENTRY_CONTROLS, __rdmsr1(MSR_IA32_VMX_ENTRY_CTLS) |
-		VM_ENTRY_IA32E_MODE);
 
 
 	// CH 26.2.2, Vol 3
@@ -211,8 +282,7 @@ bool initVmcsControlField(void) {
 	vmwrite(HOST_IDTR_BASE, get_idt_base1());
 	vmwrite(HOST_IA32_SYSENTER_ESP, __rdmsr1(MSR_IA32_SYSENTER_ESP));
 	vmwrite(HOST_IA32_SYSENTER_EIP, __rdmsr1(MSR_IA32_SYSENTER_EIP));
-	vmwrite(HOST_IA32_SYSENTER_CS, __rdmsr(MSR_IA32_SYSENTER_CS));
-
+	vmwrite(HOST_IA32_SYSENTER_CS, __rdmsr1(MSR_IA32_SYSENTER_CS));
 
 
 	// CH 26.3, Vol 3
@@ -232,8 +302,7 @@ bool initVmcsControlField(void) {
 	vmwrite(GUEST_IA32_DEBUGCTL, 0);
 	vmwrite(GUEST_IA32_PAT, vmreadz(HOST_IA32_PAT));
 	vmwrite(GUEST_IA32_EFER, vmreadz(HOST_IA32_EFER));
-	vmwrite(GUEST_IA32_PERF_GLOBAL_CTRL,
-		vmreadz(HOST_IA32_PERF_GLOBAL_CTRL));
+	vmwrite(GUEST_IA32_PERF_GLOBAL_CTRL, vmreadz(HOST_IA32_PERF_GLOBAL_CTRL));
 
 	vmwrite(GUEST_ES_LIMIT, -1);
 	vmwrite(GUEST_CS_LIMIT, -1);
@@ -245,16 +314,12 @@ bool initVmcsControlField(void) {
 	vmwrite(GUEST_TR_LIMIT, 0x67);
 	vmwrite(GUEST_GDTR_LIMIT, 0xffff);
 	vmwrite(GUEST_IDTR_LIMIT, 0xffff);
-	vmwrite(GUEST_ES_AR_BYTES,
-		vmreadz(GUEST_ES_SELECTOR) == 0 ? 0x10000 : 0xc093);
+	vmwrite(GUEST_ES_AR_BYTES, vmreadz(GUEST_ES_SELECTOR) == 0 ? 0x10000 : 0xc093);
 	vmwrite(GUEST_CS_AR_BYTES, 0xa09b);
 	vmwrite(GUEST_SS_AR_BYTES, 0xc093);
-	vmwrite(GUEST_DS_AR_BYTES,
-		vmreadz(GUEST_DS_SELECTOR) == 0 ? 0x10000 : 0xc093);
-	vmwrite(GUEST_FS_AR_BYTES,
-		vmreadz(GUEST_FS_SELECTOR) == 0 ? 0x10000 : 0xc093);
-	vmwrite(GUEST_GS_AR_BYTES,
-		vmreadz(GUEST_GS_SELECTOR) == 0 ? 0x10000 : 0xc093);
+	vmwrite(GUEST_DS_AR_BYTES, vmreadz(GUEST_DS_SELECTOR) == 0 ? 0x10000 : 0xc093);
+	vmwrite(GUEST_FS_AR_BYTES, vmreadz(GUEST_FS_SELECTOR) == 0 ? 0x10000 : 0xc093);
+	vmwrite(GUEST_GS_AR_BYTES, vmreadz(GUEST_GS_SELECTOR) == 0 ? 0x10000 : 0xc093);
 	vmwrite(GUEST_LDTR_AR_BYTES, 0x10000);
 	vmwrite(GUEST_TR_AR_BYTES, 0x8b);
 	vmwrite(GUEST_INTERRUPTIBILITY_INFO, 0);
@@ -275,7 +340,7 @@ bool initVmcsControlField(void) {
 	vmwrite(GUEST_TR_BASE, vmreadz(HOST_TR_BASE));
 	vmwrite(GUEST_GDTR_BASE, vmreadz(HOST_GDTR_BASE));
 	vmwrite(GUEST_IDTR_BASE, vmreadz(HOST_IDTR_BASE));
-	vmwrite(GUEST_RFLAGS, 2);
+	vmwrite(GUEST_RFLAGS, 2); // Disable interrupt flag
 	vmwrite(GUEST_SYSENTER_ESP, vmreadz(HOST_IA32_SYSENTER_ESP));
 	vmwrite(GUEST_SYSENTER_EIP, vmreadz(HOST_IA32_SYSENTER_EIP));
 	// setting up rip and rsp for guest
@@ -292,89 +357,110 @@ bool initVmcsControlField(void) {
 }
 
 bool initVmLaunchProcess(void){
+	if (irqs_disabled()) {
+		printk(KERN_WARNING "Before vmlaunch?");
+	}
+	uint64_t flags;
+	local_save_flags(flags);
+	printk(KERN_INFO "flags %llx\n", flags);
 	int vmlaunch_status = _vmlaunch();
+	native_restore_fl(flags);
 	if (vmlaunch_status != 0){
 		return false;
 	}
 	printk(KERN_INFO "VM exit reason is %lu!\n", (unsigned long)vmExit_reason());
 	return true;
 }
+
 bool vmxoffOperation(void)
 {
 	if (deallocate_vmxon_region()) {
 		printk(KERN_INFO "Successfully freed allocated vmxon region!\n");
-	}
-	else {
+	} else {
 		printk(KERN_INFO "Error freeing allocated vmxon region!\n");
 	}
 	if (deallocate_vmcs_region()) {
 		printk(KERN_INFO "Successfully freed allocated vmcs region!\n");
-	}
-	else {
+	} else {
 		printk(KERN_INFO "Error freeing allocated vmcs region!\n");
 	}
 	asm volatile ("vmxoff\n" : : : "cc");
 	return true;
 }
 
+bool check_vmcs(void) {
+	return true;
+}
+
 int __init start_init(void)
 {
-    if (!vmxSupport()){
+	if (irqs_disabled()) {
+		printk(KERN_WARNING "Why?");
+		return -1;
+	} else {
+		printk(KERN_INFO "irq enabled");
+	}
+	if (!vmxSupport()){
 		printk(KERN_INFO "VMX support not present! EXITING");
 		return 0;
-	}
-	else {
+	} else {
 		printk(KERN_INFO "VMX support present! CONTINUING");
 	}
 	if (!getVmxOperation()) {
 		printk(KERN_INFO "VMX Operation failed! EXITING");
 		return 0;
-	}
-	else {
+	} else {
 		printk(KERN_INFO "VMX Operation succeeded! CONTINUING");
 	}
 	if (!vmcsOperations()) {
 		printk(KERN_INFO "VMCS Allocation failed! EXITING");
 		return 0;
-	}
-	else {
+	} else {
 		printk(KERN_INFO "VMCS Allocation succeeded! CONTINUING");
 	}
 	if (!initVmcsControlField()) {
 		printk(KERN_INFO "Initialization of VMCS Control field failed! EXITING");
 		return 0;
-	}
-	else {
+	} else {
 		printk(KERN_INFO "Initializing of control fields to the most basic settings succeeded! CONTINUING");
+	}
+	if (!check_vmcs()) {
+		printk(KERN_WARNING "Failed to init VMCS Control");
+		return -1;
+	} else {
+		printk(KERN_INFO "VMCS checked");
 	}
 	if (!initVmLaunchProcess()) {
 		printk(KERN_INFO "VMLAUNCH failed! EXITING");
 		return 0;
-	}
-	else {
+	} else {
 		printk(KERN_INFO "VMLAUNCH succeeded! CONTINUING");
 	}
 
-    if (!vmxoffOperation()) {
+	if (!vmxoffOperation()) {
 		printk(KERN_INFO "VMXOFF operation failed! EXITING");
 		return 0;
-	}
-	else {
+	} else {
 		printk(KERN_INFO "VMXOFF Operation succeeded! CONTINUING\n");
 	}
-    return 0;
+
+	printk(KERN_INFO "guest val = %llx", guest[0].value);
+	printk(KERN_INFO "Intel PT data");
+	int i;
+	for (i = 0; i < 1; ++i) {
+		printk(KERN_INFO "%llx ", topa[i]);
+	}
+	return 0;
 }
 
 static void __exit end_exit(void)
 {
-    printk(KERN_INFO "Unloading the driver\n");
+	printk(KERN_INFO "Unloading the driver\n");
+	free_pages((unsigned long)topa, 7);
 	return;
 }
 
 module_init(start_init);
 module_exit(end_exit);
 
-
-MODULE_LICENSE("GPL V3");
-MODULE_AUTHOR("Shubham Dubey");
-MODULE_DESCRIPTION("ProtoVirt- A minimalistic Hypervisior ");
+MODULE_LICENSE("GPL");

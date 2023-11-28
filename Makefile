@@ -1,3 +1,5 @@
+CONFIG_MODULE_SIG=n
+
 #obj-m := main.o
 #KVERSION = $(shell uname -r)
 #all:
@@ -22,3 +24,9 @@ else
         # called from kernel build system: just declare what our modules are
 		obj-m := protovirt.o
 endif
+
+test:
+	insmod protovirt.ko
+	dmesg | tail
+	rmmod protovirt
+

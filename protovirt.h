@@ -1,10 +1,19 @@
 #include "macro.h"
 
+struct vmx_msr_entry {
+	u32 index;
+	u32 reserved;
+	u64 value;
+} __aligned(16);
+
+
 // vmxon region
 uint64_t *vmxonRegion = NULL;
 //vmcs region
 uint64_t *vmcsRegion = NULL;
-
+uint64_t *topa = NULL;
+static struct vmx_msr_entry guest[8];
+static struct vmx_msr_entry host[8];
 
 struct desc64 {
 	uint16_t limit0;
@@ -21,8 +30,6 @@ static inline unsigned long long notrace __rdmsr1(unsigned int msr)
 	DECLARE_ARGS(val, low, high);
 
 	asm volatile("1: rdmsr\n"
-		     "2:\n"
-		     _ASM_EXTABLE_HANDLE(1b, 2b, ex_handler_rdmsr_unsafe)
 		     : EAX_EDX_RET(val, low, high) : "c" (msr));
 
 	return EAX_EDX_VAL(val, low, high);
