@@ -74,9 +74,9 @@ static void guest_code(void)
 		++i;
 	}
 	if (irqs_disabled()) {
-		asm volatile ("vmcall");
+		asm volatile ("rdmsr");
 	} else {
-		asm volatile ("cpuid");
+		asm volatile ("vmcall");
 	}
 }
 
@@ -96,6 +96,8 @@ bool vmxSupport(void)
 	}
 	return false;
 }
+
+bool vmxoffOperation(void);
 
 // CH 23.7, Vol 3
 // Enter in VMX mode
@@ -149,8 +151,13 @@ bool getVmxOperation(void) {
 	}
 	vmxon_phy_region = __pa(vmxonRegion);
 	*(uint32_t *)vmxonRegion = vmcs_revision_id();
-	if (_vmxon(vmxon_phy_region))
+	if (_vmxon(vmxon_phy_region)) {
+		printk(KERN_WARNING "VMfailValid(%d)", vmreadz(VM_INSTRUCTION_ERROR));
+		if (vmreadz(VM_INSTRUCTION_ERROR) == 15) {
+			vmxoffOperation();
+		}
 		return false;
+	}
 	return true;
 }
 
@@ -193,16 +200,16 @@ bool initVmcsControlField(void) {
 	uint32_t vm_entry_control0 = __rdmsr1(MSR_IA32_VMX_ENTRY_CTLS);
 	uint32_t vm_entry_control1 = __rdmsr1(MSR_IA32_VMX_ENTRY_CTLS) >> 32;
 
-
 	// setting final value to write to control fields
 	uint32_t pinbased_control_final = (pinbased_control0 & pinbased_control1);
 	uint32_t procbased_control_final = (procbased_control0 & procbased_control1);
 	uint32_t procbased_secondary_control_final = (procbased_secondary_control0 & procbased_secondary_control1);
 	uint32_t vm_exit_control_final = (vm_exit_control0 & vm_exit_control1);
-	uint32_t vm_entry_control_final = (vm_entry_control0 & vm_entry_control1)
-					  | (VM_ENTRY_LOAD_IA32_RTIT_CTL)
-					  | (VM_ENTRY_IA32E_MODE) /* guest should be 64 bit */
+	uint32_t vm_entry_control_final = VM_ENTRY_IA32E_MODE /* guest should be 64 bit */
+					//   | (VM_ENTRY_LOAD_IA32_RTIT_CTL)
 					  ;
+	vm_entry_control_final &= vm_entry_control1;
+	vm_entry_control_final |= vm_entry_control0;
 
 	/* CH 24.7.1, Vol 3
 	// for supporting 64 bit host
@@ -220,30 +227,40 @@ bool initVmcsControlField(void) {
 	*/
 
 	uint64_t guest_ia32_rtit_ctrl_msr_val = TRACE_EN
-						// | CR3_FILTER
-						| TO_PA | BRANCH_EN
+						| CR3_FILTER
+						| BRANCH_EN | PSB_MASK
 						| CTL_OS | CTL_USER;
-	uint64_t host_ia32_rtit_ctrl_msr_val = TO_PA | CTL_OS | CTL_USER;
-	int pt_buffer_order = 7;
+	uint64_t host_ia32_rtit_ctrl_msr_val = CTL_OS | CTL_USER;
+
 	topa = (uint64_t*)__get_free_pages(GFP_KERNEL | __GFP_ZERO, pt_buffer_order);
+	guest = kzalloc(sizeof(struct vmx_msr_entry), GFP_KERNEL);
+	host = kzalloc(sizeof(struct vmx_msr_entry), GFP_KERNEL);
 
 	guest[0].index = MSR_IA32_RTIT_CTL;
 	guest[0].reserved = 0;
-	guest[0].value = 0xdeadbeef;
+	guest[0].value = guest_ia32_rtit_ctrl_msr_val;
 	host[0].index = MSR_IA32_RTIT_CTL;
 	host[0].reserved = 0;
-	host[0].value = host_ia32_rtit_ctrl_msr_val;
-	// vmwrite(VM_ENTRY_MSR_LOAD_COUNT, 1);
-	// vmwrite(VM_ENTRY_MSR_LOAD_ADDR, __pa(guest));
+	host[0].value = 0;
+	uint64_t cr3 = get_cr3();
+	uint64_t pud = *(uint64_t *)(0xffff880000000000ull + (((cr3 >> 12) << 12) & ((1ull << 48) - 1)) + 8 * (((uint64_t)guest >> 39) & 0x1ff));
+	uint64_t pmd = *(uint64_t *)(0xffff880000000000ull + (((pud >> 12) << 12) & ((1ull << 48) - 1)) + 8 * (((uint64_t)guest >> 30) & 0x1ff));
+	uint64_t pgt = *(uint64_t *)(0xffff880000000000ull + (((pmd >> 12) << 12) & ((1ull << 48) - 1)) + 8 * (((uint64_t)guest >> 21) & 0x1ff));
+	uint64_t pte = *(uint64_t *)(0xffff880000000000ull + (((pgt >> 12) << 12) & ((1ull << 48) - 1)) + 8 * (((uint64_t)guest >> 12) & 0x1ff));
+	if ((pte & ((1ull << 48) - 1) & ~0xfffull) != (__pa(guest) & ~0xfffull)) {
+		printk(KERN_INFO "guest: %px %llx %llx", guest, __pa(guest), pte);
+		return false;
+	}
+	vmwrite(VM_ENTRY_MSR_LOAD_COUNT, 1);
+	vmwrite(VM_ENTRY_MSR_LOAD_ADDR, __pa(guest));
 	vmwrite(VM_EXIT_MSR_LOAD_COUNT, 1);
 	vmwrite(VM_EXIT_MSR_LOAD_ADDR, __pa(host));
-	vmwrite(VM_EXIT_MSR_STORE_COUNT, 1);
-	vmwrite(VM_EXIT_MSR_STORE_ADDR, __pa(guest));
 
-	wrmsrl(MSR_IA32_RTIT_CR3_MATCH, get_cr3()); // tell intel pt to only trace current cr3
-	wrmsrl(MSR_IA32_RTIT_OUTPUT_BASE, __pa(topa));
+	wrmsrl(MSR_IA32_RTIT_CR3_MATCH, get_cr3() & ~X86_CR3_PCID_MASK); // tell intel pt to only trace current cr3
+	wrmsrl_safe(MSR_IA32_RTIT_OUTPUT_BASE, __pa(topa));
 	wrmsrl(MSR_IA32_RTIT_OUTPUT_MASK_PTRS, ((1ull << (PAGE_SHIFT + pt_buffer_order)) - 1));
-	vmwrite(GUEST_IA32_RTIT_CTL, guest_ia32_rtit_ctrl_msr_val);
+	// printk(KERN_INFO "mask: %llx base: %llx %llx %llx", __rdmsr1(MSR_IA32_RTIT_OUTPUT_MASK_PTRS), __rdmsr1(MSR_IA32_RTIT_OUTPUT_BASE), __pa(topa), topa);
+	// vmwrite(GUEST_IA32_RTIT_CTL, guest_ia32_rtit_ctrl_msr_val);
 
 	// writing the value to control field
 	vmwrite(PIN_BASED_VM_EXEC_CONTROLS, pinbased_control_final);
@@ -340,7 +357,7 @@ bool initVmcsControlField(void) {
 	vmwrite(GUEST_TR_BASE, vmreadz(HOST_TR_BASE));
 	vmwrite(GUEST_GDTR_BASE, vmreadz(HOST_GDTR_BASE));
 	vmwrite(GUEST_IDTR_BASE, vmreadz(HOST_IDTR_BASE));
-	vmwrite(GUEST_RFLAGS, 2); // Disable interrupt flag
+	vmwrite(GUEST_RFLAGS, 0x202); // Disable interrupt flag
 	vmwrite(GUEST_SYSENTER_ESP, vmreadz(HOST_IA32_SYSENTER_ESP));
 	vmwrite(GUEST_SYSENTER_EIP, vmreadz(HOST_IA32_SYSENTER_EIP));
 	// setting up rip and rsp for guest
@@ -363,11 +380,17 @@ bool initVmLaunchProcess(void){
 	uint64_t flags;
 	local_save_flags(flags);
 	printk(KERN_INFO "flags %llx\n", flags);
-	int vmlaunch_status = _vmlaunch();
-	native_restore_fl(flags);
-	if (vmlaunch_status != 0){
+	_vmlaunch();
+	local_save_flags(flags);
+	if (flags & X86_EFLAGS_ZF) {
+		printk(KERN_WARNING "VMfailValid(%d)", vmreadz(VM_INSTRUCTION_ERROR));
+		return false;
+	} else if (flags & X86_EFLAGS_CF) {
+		printk(KERN_WARNING "VMfailInvalid");
 		return false;
 	}
+	printk(KERN_INFO "flags after vm exit %llx\n", vmreadz(GUEST_RFLAGS));
+	local_irq_restore(0x202);
 	printk(KERN_INFO "VM exit reason is %lu!\n", (unsigned long)vmExit_reason());
 	return true;
 }
@@ -389,17 +412,14 @@ bool vmxoffOperation(void)
 }
 
 bool check_vmcs(void) {
+	printk(KERN_INFO "VM_ENTRY_CONTROLS %llx", vmreadz(VM_ENTRY_CONTROLS));
+	printk(KERN_INFO "VM_EXIT_CONTROLS %llx", vmreadz(VM_EXIT_CONTROLS));
+	printk(KERN_INFO "VMCS header %llx %llx", vmcsRegion[0], vmcsRegion[1]);
 	return true;
 }
 
 int __init start_init(void)
 {
-	if (irqs_disabled()) {
-		printk(KERN_WARNING "Why?");
-		return -1;
-	} else {
-		printk(KERN_INFO "irq enabled");
-	}
 	if (!vmxSupport()){
 		printk(KERN_INFO "VMX support not present! EXITING");
 		return 0;
@@ -414,49 +434,56 @@ int __init start_init(void)
 	}
 	if (!vmcsOperations()) {
 		printk(KERN_INFO "VMCS Allocation failed! EXITING");
-		return 0;
+		goto err;
 	} else {
 		printk(KERN_INFO "VMCS Allocation succeeded! CONTINUING");
 	}
 	if (!initVmcsControlField()) {
 		printk(KERN_INFO "Initialization of VMCS Control field failed! EXITING");
-		return 0;
+		goto err;
 	} else {
 		printk(KERN_INFO "Initializing of control fields to the most basic settings succeeded! CONTINUING");
 	}
 	if (!check_vmcs()) {
 		printk(KERN_WARNING "Failed to init VMCS Control");
-		return -1;
+		goto err;
 	} else {
 		printk(KERN_INFO "VMCS checked");
 	}
 	if (!initVmLaunchProcess()) {
 		printk(KERN_INFO "VMLAUNCH failed! EXITING");
-		return 0;
 	} else {
 		printk(KERN_INFO "VMLAUNCH succeeded! CONTINUING");
 	}
 
+	printk(KERN_INFO "RTIT status %llx PacketByteCnt %llu\n", __rdmsr1(MSR_IA32_RTIT_STATUS), (__rdmsr1(MSR_IA32_RTIT_STATUS) >> 32) & 0x1ffff);
 	if (!vmxoffOperation()) {
 		printk(KERN_INFO "VMXOFF operation failed! EXITING");
-		return 0;
+		goto err;
 	} else {
 		printk(KERN_INFO "VMXOFF Operation succeeded! CONTINUING\n");
 	}
 
-	printk(KERN_INFO "guest val = %llx", guest[0].value);
-	printk(KERN_INFO "Intel PT data");
-	int i;
-	for (i = 0; i < 1; ++i) {
-		printk(KERN_INFO "%llx ", topa[i]);
+	printk(KERN_INFO "Intel PT data %llx %llx\n", topa[0], topa[1]);
+
+	if (__rdmsr1(MSR_IA32_RTIT_CTL) & TRACE_EN) {
+		printk(KERN_INFO "TRACE_ON==1, so disable intel pt");
+		wrmsrl_safe(MSR_IA32_RTIT_CTL, 0);
 	}
+
 	return 0;
+
+err:
+	vmxoffOperation();
+	return -1;
 }
 
 static void __exit end_exit(void)
 {
 	printk(KERN_INFO "Unloading the driver\n");
-	free_pages((unsigned long)topa, 7);
+	free_pages((unsigned long)topa, pt_buffer_order);
+	kfree(host);
+	kfree(guest);
 	return;
 }
 

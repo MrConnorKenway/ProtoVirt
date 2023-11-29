@@ -12,8 +12,9 @@ uint64_t *vmxonRegion = NULL;
 //vmcs region
 uint64_t *vmcsRegion = NULL;
 uint64_t *topa = NULL;
-static struct vmx_msr_entry guest[8];
-static struct vmx_msr_entry host[8];
+int pt_buffer_order = 9;
+static struct vmx_msr_entry *guest;
+static struct vmx_msr_entry *host;
 
 struct desc64 {
 	uint16_t limit0;
@@ -138,8 +139,6 @@ static inline uint64_t get_desc64_base(const struct desc64 *desc)
 
 static inline int _vmlaunch(void)
 {
-	int ret;
-
 	__asm__ __volatile__("push %%rbp;"
 			     "push %%rcx;"
 			     "push %%rdx;"
@@ -150,19 +149,17 @@ static inline int _vmlaunch(void)
 			     "lea 1f(%%rip), %%rax;"
 			     "vmwrite %%rax, %[host_rip];"
 			     "vmlaunch;"
-			     "incq (%%rsp);"
 			     "1: pop %%rax;"
 			     "pop %%rdi;"
 			     "pop %%rsi;"
 			     "pop %%rdx;"
 			     "pop %%rcx;"
 			     "pop %%rbp;"
-			     : [ret]"=&a"(ret)
+			     :
 			     : [host_rsp]"r"((uint64_t)HOST_RSP),
 			       [host_rip]"r"((uint64_t)HOST_RIP)
 			     : "memory", "cc", "rbx", "r8", "r9", "r10",
 			       "r11", "r12", "r13", "r14", "r15");
-	return ret;
 }
 
 

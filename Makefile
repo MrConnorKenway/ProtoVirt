@@ -27,6 +27,6 @@ endif
 
 test:
 	insmod protovirt.ko
-	dmesg | tail
+	dmesg | tail -20
 	rmmod protovirt
 
